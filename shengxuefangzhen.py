@@ -186,6 +186,11 @@ class AcousticSimulator:
         
         # 反射系数场
         self.reflection_coeff = np.ones((self.nx, self.ny))
+
+        # 预计算网格坐标，供声源激励使用（避免每步重复 meshgrid）
+        self._grid_x, self._grid_y = np.meshgrid(
+            np.arange(self.nx), np.arange(self.ny), indexing='ij'
+        )
         
     def _check_cfl_condition(self):
         """检查CFL稳定性条件"""
@@ -254,17 +259,15 @@ class AcousticSimulator:
                     
                 elif source.source_type == SoundSourceType.LINE:
                     # 线声源：沿给定方向延伸；无方向时默认水平线（沿 x 轴）
+                    # SoundSource.__post_init__ 保证 direction 已归一化
                     signal = source.get_signal(self.current_time)
                     if source.direction is not None:
                         dir_x, dir_y = source.direction
                         # 法向量（垂直于线方向）
                         perp_x, perp_y = -dir_y, dir_x
-                        gx_grid, gy_grid = np.meshgrid(
-                            np.arange(self.nx), np.arange(self.ny), indexing='ij'
-                        )
-                        # 各格点到源点在法向量方向的距离 < 0.5 即在线上
+                        # 使用预计算的网格坐标
                         perp_dist = np.abs(
-                            (gx_grid - px) * perp_x + (gy_grid - py) * perp_y
+                            (self._grid_x - px) * perp_x + (self._grid_y - py) * perp_y
                         )
                         self.pressure[perp_dist < 0.5] += signal
                     else:
@@ -273,6 +276,7 @@ class AcousticSimulator:
 
                 elif source.source_type == SoundSourceType.DIRECTIONAL:
                     # 定向声源：主方向前向增强，反方向抑制，形成心形指向性
+                    # SoundSource.__post_init__ 保证 direction 已归一化
                     signal = source.get_wave_packet(self.current_time)
                     self.pressure[px, py] += signal
                     if source.direction is not None:
@@ -290,14 +294,12 @@ class AcousticSimulator:
 
                 elif source.source_type == SoundSourceType.PLANE:
                     # 面声源（2D 中为平面波前）：激励垂直于传播方向的直线
+                    # SoundSource.__post_init__ 保证 direction 已归一化
                     signal = source.get_wave_packet(self.current_time)
                     if source.direction is not None:
                         dir_x, dir_y = source.direction
-                        gx_grid, gy_grid = np.meshgrid(
-                            np.arange(self.nx), np.arange(self.ny), indexing='ij'
-                        )
-                        # 各格点在传播方向上的投影距离 < 0.5 即在法平面上
-                        proj = (gx_grid - px) * dir_x + (gy_grid - py) * dir_y
+                        # 使用预计算的网格坐标；投影距离 < 0.5 即在法平面上
+                        proj = (self._grid_x - px) * dir_x + (self._grid_y - py) * dir_y
                         self.pressure[np.abs(proj) < 0.5] += signal
                     else:
                         # 默认：沿 x 方向传播的平面波（激励 y 轴线）
@@ -682,8 +684,8 @@ class RoomAcousticSimulator(AcousticSimulator):
             return 0.0
             
         t = np.arange(len(energy)) * self.dt
-        safe_energy = np.where(energy > 0, energy, np.nan)
-        log_energy = 10 * np.log10(safe_energy / max_energy)
+        nonzero_energy = np.where(energy > 0, energy, np.nan)
+        log_energy = 10 * np.log10(nonzero_energy / max_energy)
         
         # 同时过滤掉 NaN（零值产生）
         valid_mask = decay_mask & np.isfinite(log_energy)
@@ -729,6 +731,7 @@ class BeamformingSimulator:
             波束图（每个扫描点的估计能量）
         """
         num_samples = signals.shape[1]
+        scan_grid = np.asarray(scan_grid, dtype=float)  # 统一在循环外转换，避免重复开销
         num_points = len(scan_grid)
         beamforming_map = np.zeros(num_points)
         
@@ -736,7 +739,6 @@ class BeamformingSimulator:
         array_center = np.mean(self.mic_positions, axis=0)
         
         for i, point in enumerate(scan_grid):
-            point = np.asarray(point, dtype=float)
             # 近场：用各麦克风到扫描点的实际距离计算传播延迟
             distances = np.linalg.norm(self.mic_positions - point, axis=1)  # (num_mics,)
             ref_distance = np.linalg.norm(array_center - point)
@@ -804,8 +806,9 @@ class AcousticAgent:
         if self.simulator is None:
             return {}
         self.perceived_pressure = self.simulator.get_pressure_at_point(self.position)
-        x = int(self.position[0] / self.simulator.dx)
-        y = int(self.position[1] / self.simulator.dy)
+        # 将位置裁剪到有效网格范围，防止越界
+        x = int(np.clip(self.position[0] / self.simulator.dx, 0, self.simulator.nx - 1))
+        y = int(np.clip(self.position[1] / self.simulator.dy, 0, self.simulator.ny - 1))
         self.perceived_spl = self.simulator.compute_spl((x, y))
         return {
             'position': self.position.copy(),
@@ -846,7 +849,7 @@ class AcousticAgent:
             关联的 SoundSource 实例
         """
         if self.simulator is None:
-            raise RuntimeError("智能体未绑定到仿真器，请先调用 attach()")
+            raise RuntimeError("Agent not attached to a simulator. Call attach() first.")
         if self._sound_source is None:
             self._sound_source = SoundSource(
                 position=self.position.copy(),
