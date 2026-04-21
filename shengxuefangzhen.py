@@ -3,20 +3,24 @@
 Acoustic Simulation Engine Based on Agent
 
 功能特性:
-- 2D/3D声场波动方程求解
-- 多种声源类型（点源、线源、面源）
+- 2D声场波动方程有限差分求解
+- 多种声源类型（点源、线源、面源、定向声源）
 - 声波传播与吸收模拟
 - 障碍物反射与散射
-- 实时可视化
-- 频域分析
+- 吸收/反射/周期边界条件
+- 实时可视化与频域分析
+- 房间声学（RT60）
+- 波束形成（近场距离模型）
+- AcousticAgent 智能体（感知 / 移动 / 发声）
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from matplotlib.colors import LinearSegmentedColormap
+from collections import deque
 from dataclasses import dataclass, field
-from typing import List, Tuple, Optional, Dict
+from typing import Deque, Dict, List, Optional, Tuple
 from enum import Enum
 import warnings
 
@@ -176,9 +180,9 @@ class AcousticSimulator:
         self.current_time = 0.0
         self.time_steps = 0
         
-        # 声场历史记录
-        self.history: List[np.ndarray] = []
+        # 声场历史记录（deque 自动丢弃最旧帧，避免 O(n) pop(0)）
         self.max_history = 500
+        self.history: Deque[np.ndarray] = deque(maxlen=self.max_history)
         
         # 反射系数场
         self.reflection_coeff = np.ones((self.nx, self.ny))
@@ -194,6 +198,9 @@ class AcousticSimulator:
             print("调整时间步长以满足稳定性条件...")
             max_dt = self.config.cfl_number * min(self.dx, self.dy) / self.c
             self.dt = max_dt * 0.9
+            # 将调整后的时间步长同步回配置，保持 sample_rate 一致
+            self.config.time_step = self.dt
+            self.config.sample_rate = int(round(1.0 / self.dt))
             print(f"新时间步长: {self.dt:.6f} s")
         
     def add_source(self, source: SoundSource):
@@ -246,12 +253,55 @@ class AcousticSimulator:
                     self.pressure[px, py] += signal
                     
                 elif source.source_type == SoundSourceType.LINE:
-                    # 线声源
+                    # 线声源：沿给定方向延伸；无方向时默认水平线（沿 x 轴）
                     signal = source.get_signal(self.current_time)
-                    if len(source.position) == 2:
-                        self.pressure[px, :] += signal
+                    if source.direction is not None:
+                        dir_x, dir_y = source.direction
+                        # 法向量（垂直于线方向）
+                        perp_x, perp_y = -dir_y, dir_x
+                        gx_grid, gy_grid = np.meshgrid(
+                            np.arange(self.nx), np.arange(self.ny), indexing='ij'
+                        )
+                        # 各格点到源点在法向量方向的距离 < 0.5 即在线上
+                        perp_dist = np.abs(
+                            (gx_grid - px) * perp_x + (gy_grid - py) * perp_y
+                        )
+                        self.pressure[perp_dist < 0.5] += signal
                     else:
-                        self.pressure[px, :] += signal
+                        # 默认：沿 x 轴的水平线声源
+                        self.pressure[:, py] += signal
+
+                elif source.source_type == SoundSourceType.DIRECTIONAL:
+                    # 定向声源：主方向前向增强，反方向抑制，形成心形指向性
+                    signal = source.get_wave_packet(self.current_time)
+                    self.pressure[px, py] += signal
+                    if source.direction is not None:
+                        dir_x, dir_y = source.direction
+                        # 前向相邻格点施加同相激励
+                        fwd_px = int(round(px + dir_x))
+                        fwd_py = int(round(py + dir_y))
+                        if 0 <= fwd_px < self.nx and 0 <= fwd_py < self.ny:
+                            self.pressure[fwd_px, fwd_py] += signal * 0.5
+                        # 后向相邻格点施加反相激励，抑制后向辐射
+                        bwd_px = int(round(px - dir_x))
+                        bwd_py = int(round(py - dir_y))
+                        if 0 <= bwd_px < self.nx and 0 <= bwd_py < self.ny:
+                            self.pressure[bwd_px, bwd_py] -= signal * 0.5
+
+                elif source.source_type == SoundSourceType.PLANE:
+                    # 面声源（2D 中为平面波前）：激励垂直于传播方向的直线
+                    signal = source.get_wave_packet(self.current_time)
+                    if source.direction is not None:
+                        dir_x, dir_y = source.direction
+                        gx_grid, gy_grid = np.meshgrid(
+                            np.arange(self.nx), np.arange(self.ny), indexing='ij'
+                        )
+                        # 各格点在传播方向上的投影距离 < 0.5 即在法平面上
+                        proj = (gx_grid - px) * dir_x + (gy_grid - py) * dir_y
+                        self.pressure[np.abs(proj) < 0.5] += signal
+                    else:
+                        # 默认：沿 x 方向传播的平面波（激励 y 轴线）
+                        self.pressure[:, py] += signal
                         
     def _apply_boundary_conditions(self, target_field: Optional[np.ndarray] = None):
         """应用边界条件"""
@@ -324,9 +374,9 @@ class AcousticSimulator:
         damping = 1 - self.config.damping
         self.pressure_next[1:-1, 1:-1] *= damping
         
-        # 应用障碍物反射
+        # 应用障碍物反射（直接乘以反射系数，物理上对应能量衰减）
         reflection_effect = self.reflection_coeff[1:-1, 1:-1]
-        self.pressure_next[1:-1, 1:-1] *= (1 + reflection_effect) / 2
+        self.pressure_next[1:-1, 1:-1] *= reflection_effect
         
     def step(self) -> bool:
         """
@@ -353,9 +403,7 @@ class AcousticSimulator:
         self.current_time += self.dt
         self.time_steps += 1
         
-        # 记录历史
-        if len(self.history) >= self.max_history:
-            self.history.pop(0)
+        # 记录历史（deque 达到 maxlen 时自动丢弃最旧帧）
         self.history.append(self.pressure.copy())
         
         # 检查是否到达总仿真时间
@@ -507,8 +555,6 @@ class AcousticVisualizer:
         if self.fig is None:
             self.setup_figure()
             
-        self.ax[0].clear()
-        
         def update(frame):
             if frame < len(self.simulator.history):
                 pressure = self.simulator.history[frame]
@@ -624,21 +670,25 @@ class RoomAcousticSimulator(AcousticSimulator):
         center = (self.nx // 2, self.ny // 2)
         energy = np.array([h[center[0], center[1]]**2 for h in self.history])
         
-        # 找衰减段
         max_energy = np.max(energy)
+        if max_energy <= 0:
+            return 0.0
+
         threshold_60db = max_energy * 1e-6  # 60dB衰减
         
-        # 线性拟合求RT60
+        # 只对正值取对数，避免 log(0) 警告
         decay_mask = energy > threshold_60db
         if np.sum(decay_mask) < 10:
             return 0.0
             
         t = np.arange(len(energy)) * self.dt
-        log_energy = 10 * np.log10(energy / max_energy)
+        safe_energy = np.where(energy > 0, energy, np.nan)
+        log_energy = 10 * np.log10(safe_energy / max_energy)
         
-        # 线性回归
-        valid_t = t[decay_mask]
-        valid_energy = log_energy[decay_mask]
+        # 同时过滤掉 NaN（零值产生）
+        valid_mask = decay_mask & np.isfinite(log_energy)
+        valid_t = t[valid_mask]
+        valid_energy = log_energy[valid_mask]
         
         if len(valid_t) > 2:
             coeffs = np.polyfit(valid_t, valid_energy, 1)
@@ -665,34 +715,33 @@ class BeamformingSimulator:
         self.sample_rate = array_config.get('sample_rate', 44100)
         self.c = array_config.get('speed_of_sound', 343.0)
         
-    def delay_and_sum(self, signals: np.ndarray, scan_grid: np.ndarray, 
+    def delay_and_sum(self, signals: np.ndarray, scan_grid: np.ndarray,
                       steering_angle: float = 0) -> np.ndarray:
         """
-        延迟求和波束形成
+        延迟求和波束形成（近场距离模型）
         
         参数:
             signals: 麦克风信号 (num_mics, num_samples)
             scan_grid: 扫描网格 (num_points, 2)
-            steering_angle: 导向角度 (度)
+            steering_angle: 保留参数（近场模式下不使用）
         
         返回:
-            波束图
+            波束图（每个扫描点的估计能量）
         """
         num_samples = signals.shape[1]
         num_points = len(scan_grid)
         beamforming_map = np.zeros(num_points)
         
-        # 导向向量
-        steering_vec = np.array([
-            np.cos(np.radians(steering_angle)),
-            np.sin(np.radians(steering_angle))
-        ])
+        # 阵列中心作为参考点
+        array_center = np.mean(self.mic_positions, axis=0)
         
         for i, point in enumerate(scan_grid):
-            # 计算每个麦克风的延迟
-            delays = np.dot(self.mic_positions - point, steering_vec) / self.c
-            
-            # 时间索引偏移
+            point = np.asarray(point, dtype=float)
+            # 近场：用各麦克风到扫描点的实际距离计算传播延迟
+            distances = np.linalg.norm(self.mic_positions - point, axis=1)  # (num_mics,)
+            ref_distance = np.linalg.norm(array_center - point)
+            # 相对延迟（正值：信号到达该麦克风更晚）
+            delays = (distances - ref_distance) / self.c
             delay_samples = np.round(delays * self.sample_rate).astype(int)
             
             # 对整段信号做延迟对齐后再求和
@@ -703,13 +752,130 @@ class BeamformingSimulator:
                     aligned[m, d:] = signals[m, :num_samples - d]
                 elif d < 0 and -d < num_samples:
                     aligned[m, :num_samples + d] = signals[m, -d:]
-                elif d == 0:
+                else:
                     aligned[m, :] = signals[m, :]
 
             beam = np.mean(aligned, axis=0)
             beamforming_map[i] = np.mean(beam**2)
             
         return beamforming_map
+
+
+class AcousticAgent:
+    """
+    声学智能体
+
+    代表仿真环境中具有自主行为的实体，能够：
+    - 感知（perceive）：读取当前位置的声压和声压级
+    - 移动（move）：在仿真空间中改变位置
+    - 发声（emit_sound）：在当前位置激活/更新声源
+    - 静默（silence）：停止发出声音
+
+    使用示例::
+
+        agent = AcousticAgent(position=np.array([5.0, 5.0]), name="Agent-1")
+        agent.attach(simulator)
+        agent.emit_sound(frequency=440.0, amplitude=1.0)
+        simulator.step()
+        state = agent.perceive()
+        agent.move(np.array([6.0, 5.0]))
+    """
+
+    def __init__(self, position: np.ndarray, name: str = "Agent"):
+        self.position = np.array(position, dtype=float)
+        self.name = name
+        self.simulator: Optional[AcousticSimulator] = None
+        self.perceived_pressure: float = 0.0
+        self.perceived_spl: float = 0.0
+        self.action_history: List[Dict] = []
+        self._sound_source: Optional[SoundSource] = None
+
+    def attach(self, simulator: 'AcousticSimulator') -> None:
+        """将智能体绑定到仿真器"""
+        self.simulator = simulator
+
+    def perceive(self) -> Dict:
+        """
+        感知当前位置的声场状态
+
+        返回:
+            包含 position / pressure / spl / time 的字典
+        """
+        if self.simulator is None:
+            return {}
+        self.perceived_pressure = self.simulator.get_pressure_at_point(self.position)
+        x = int(self.position[0] / self.simulator.dx)
+        y = int(self.position[1] / self.simulator.dy)
+        self.perceived_spl = self.simulator.compute_spl((x, y))
+        return {
+            'position': self.position.copy(),
+            'pressure': self.perceived_pressure,
+            'spl': self.perceived_spl,
+            'time': self.simulator.current_time,
+        }
+
+    def move(self, new_position: np.ndarray) -> None:
+        """
+        移动到新位置
+
+        如果智能体当前有声源，声源位置也会同步更新。
+        """
+        new_position = np.array(new_position, dtype=float)
+        self.action_history.append({
+            'type': 'move',
+            'from': self.position.copy(),
+            'to': new_position.copy(),
+            'time': self.simulator.current_time if self.simulator else 0.0,
+        })
+        self.position = new_position
+        if self._sound_source is not None:
+            self._sound_source.position = new_position.copy()
+
+    def emit_sound(
+        self,
+        frequency: float,
+        amplitude: float,
+        source_type: SoundSourceType = SoundSourceType.POINT,
+    ) -> SoundSource:
+        """
+        在当前位置发出声音
+
+        首次调用时向仿真器注册声源；后续调用更新频率和振幅。
+
+        返回:
+            关联的 SoundSource 实例
+        """
+        if self.simulator is None:
+            raise RuntimeError("智能体未绑定到仿真器，请先调用 attach()")
+        if self._sound_source is None:
+            self._sound_source = SoundSource(
+                position=self.position.copy(),
+                frequency=frequency,
+                amplitude=amplitude,
+                source_type=source_type,
+            )
+            self.simulator.add_source(self._sound_source)
+        else:
+            self._sound_source.frequency = frequency
+            self._sound_source.amplitude = amplitude
+            self._sound_source.source_type = source_type
+            self._sound_source.active = True
+        self.action_history.append({
+            'type': 'emit',
+            'frequency': frequency,
+            'amplitude': amplitude,
+            'time': self.simulator.current_time,
+        })
+        return self._sound_source
+
+    def silence(self) -> None:
+        """停止当前声源"""
+        if self._sound_source is not None:
+            self._sound_source.active = False
+            self.action_history.append({
+                'type': 'silence',
+                'time': self.simulator.current_time if self.simulator else 0.0,
+            })
 
 
 # ============== 示例和测试 ==============
