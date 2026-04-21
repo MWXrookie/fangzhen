@@ -18,9 +18,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from matplotlib.colors import LinearSegmentedColormap
+from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Tuple, Union
 from enum import Enum
 import warnings
 
@@ -144,7 +145,30 @@ class AcousticConfig:
                 self.sample_rate = inferred_sample_rate
 
 
-class AcousticSimulator:
+class BaseAcousticSimulator(ABC):
+    """
+    所有声学仿真器的抽象基类
+
+    定义统一接口，使工厂函数与智能体可以透明地使用任意仿真模型。
+    """
+
+    @abstractmethod
+    def step(self) -> bool:
+        """执行一步仿真，返回是否继续仿真"""
+        ...
+
+    @abstractmethod
+    def simulate(self) -> Optional[np.ndarray]:
+        """运行完整仿真，返回最终声压场（不适用时返回 None）"""
+        ...
+
+    @abstractmethod
+    def get_pressure_at_point(self, position: np.ndarray) -> float:
+        """获取指定空间位置的瞬时声压（不适用时返回 0.0）"""
+        ...
+
+
+class AcousticSimulator(BaseAcousticSimulator):
     """
     声学仿真引擎
     实现2D波动方程的有限差分法求解
@@ -704,7 +728,7 @@ class RoomAcousticSimulator(AcousticSimulator):
         return 0.0
 
 
-class BeamformingSimulator:
+class BeamformingSimulator(BaseAcousticSimulator):
     """
     波束形成仿真器
     用于麦克风阵列声源定位
@@ -716,6 +740,23 @@ class BeamformingSimulator:
         self.num_mics = len(self.mic_positions)
         self.sample_rate = array_config.get('sample_rate', 44100)
         self.c = array_config.get('speed_of_sound', 343.0)
+
+    # ------------------------------------------------------------------
+    # BaseAcousticSimulator 接口实现
+    # BeamformingSimulator 基于离线信号处理，不支持逐步时域推进。
+    # ------------------------------------------------------------------
+
+    def step(self) -> bool:
+        """波束形成器无时间步推进，始终返回 False。"""
+        return False
+
+    def simulate(self) -> Optional[np.ndarray]:
+        """波束形成器需外部提供信号，此处返回 None。请直接调用 delay_and_sum()。"""
+        return None
+
+    def get_pressure_at_point(self, position: np.ndarray) -> float:
+        """波束形成器无声压场，始终返回 0.0。"""
+        return 0.0
         
     def delay_and_sum(self, signals: np.ndarray, scan_grid: np.ndarray,
                       steering_angle: float = 0) -> np.ndarray:
@@ -763,6 +804,119 @@ class BeamformingSimulator:
         return beamforming_map
 
 
+def create_simulator(params: dict) -> BaseAcousticSimulator:
+    """
+    工厂函数：根据用户参数自动选择并创建合适的声学仿真器。
+
+    选择规则（按优先级）：
+
+    1. 若 params 含 ``mic_positions`` → :class:`BeamformingSimulator`
+       （麦克风阵列波束形成，声源定位场景）
+    2. 若 params 含 ``room_size`` 或 ``walls`` → :class:`RoomAcousticSimulator`
+       （房间声学，混响/RT60 计算场景）
+    3. 若 ``max_frequency``（或 ``frequency``）> 1000 Hz 且未显式指定
+       ``grid_resolution`` → 自动推算精细网格的 :class:`AcousticSimulator`
+       （高频短波长需更密集采样）
+    4. 其他情况 → 默认 :class:`AcousticSimulator`
+
+    参数
+    ----
+    params : dict
+        可包含以下键（均为可选）：
+
+        **BeamformingSimulator 专用**
+
+        - ``mic_positions``  : array-like, 麦克风坐标列表
+        - ``speed_of_sound`` : float, 声速 (m/s)，默认 343.0
+
+        **RoomAcousticSimulator 专用**
+
+        - ``room_size`` : tuple[float, float]，房间尺寸 (m)
+        - ``walls``     : list，墙壁描述（仅用于触发房间模型选择）
+
+        **AcousticConfig 通用字段**
+
+        - ``sample_rate``      : int
+        - ``grid_resolution``  : tuple[int, int]
+        - ``spatial_domain``   : tuple[float, float]
+        - ``time_step``        : float
+        - ``total_time``       : float
+        - ``cfl_number``       : float
+        - ``boundary_type``    : str
+        - ``damping``          : float
+        - ``material``         : MaterialProperties
+        - ``max_frequency``    : float，用于自动网格推算（不传入仿真器）
+        - ``frequency``        : float，备用频率（不传入仿真器）
+
+    返回
+    ----
+    BaseAcousticSimulator
+        具体类型由参数决定。
+
+    示例
+    ----
+    >>> # 房间声学
+    >>> sim = create_simulator({"room_size": (10.0, 8.0), "boundary_type": "reflecting"})
+    >>> isinstance(sim, RoomAcousticSimulator)
+    True
+
+    >>> # 波束形成
+    >>> sim = create_simulator({"mic_positions": [[0, 0], [1, 0], [2, 0]]})
+    >>> isinstance(sim, BeamformingSimulator)
+    True
+
+    >>> # 高频自动精细网格
+    >>> sim = create_simulator({"max_frequency": 2000.0, "spatial_domain": (5.0, 5.0)})
+    >>> isinstance(sim, AcousticSimulator)
+    True
+    """
+    # ── 1. 波束形成 ──────────────────────────────────────────────────────
+    if 'mic_positions' in params:
+        array_config: Dict = {
+            'mic_positions': params['mic_positions'],
+            'sample_rate': params.get('sample_rate', 44100),
+            'speed_of_sound': params.get('speed_of_sound', 343.0),
+        }
+        return BeamformingSimulator(array_config)
+
+    # ── 共用：从 params 构建 AcousticConfig ─────────────────────────────
+    spatial_domain: Tuple[float, float] = params.get('spatial_domain', (10.0, 10.0))
+    speed_of_sound: float = params.get('speed_of_sound', 343.0)
+
+    # 自动推算网格分辨率（高频场景，且用户未显式指定时）
+    if 'grid_resolution' not in params:
+        max_freq: float = params.get('max_frequency', params.get('frequency', 440.0))
+        if max_freq > 1000.0:
+            min_wavelength = speed_of_sound / max_freq
+            # 每个波长至少 10 个网格点（采样定理安全余量）
+            recommended_dx = min_wavelength / 10.0
+            recommended_nx = max(100, int(spatial_domain[0] / recommended_dx))
+            recommended_ny = max(100, int(spatial_domain[1] / recommended_dx))
+            grid_resolution: Tuple[int, int] = (recommended_nx, recommended_ny)
+        else:
+            grid_resolution = (200, 200)
+    else:
+        grid_resolution = params['grid_resolution']
+
+    # 仅提取 AcousticConfig 合法字段
+    _CONFIG_KEYS = {'sample_rate', 'time_step', 'total_time', 'cfl_number',
+                    'boundary_type', 'damping', 'material'}
+    config_kwargs: Dict = {'grid_resolution': grid_resolution, 'spatial_domain': spatial_domain}
+    for key in _CONFIG_KEYS:
+        if key in params:
+            config_kwargs[key] = params[key]
+
+    config = AcousticConfig(**config_kwargs)
+
+    # ── 2. 房间声学 ──────────────────────────────────────────────────────
+    if 'room_size' in params or 'walls' in params:
+        room_size: Tuple[float, float] = params.get('room_size', spatial_domain)
+        return RoomAcousticSimulator(config, room_size=room_size)
+
+    # ── 3 & 4. 默认 / 高频精细网格 ──────────────────────────────────────
+    return AcousticSimulator(config)
+
+
 class AcousticAgent:
     """
     声学智能体
@@ -786,13 +940,52 @@ class AcousticAgent:
     def __init__(self, position: np.ndarray, name: str = "Agent"):
         self.position = np.array(position, dtype=float)
         self.name = name
-        self.simulator: Optional[AcousticSimulator] = None
+        self.simulator: Optional[BaseAcousticSimulator] = None
         self.perceived_pressure: float = 0.0
         self.perceived_spl: float = 0.0
         self.action_history: List[Dict] = []
         self._sound_source: Optional[SoundSource] = None
 
-    def attach(self, simulator: 'AcousticSimulator') -> None:
+    @classmethod
+    def from_params(cls, position: np.ndarray, params: dict,
+                    name: str = "Agent") -> 'AcousticAgent':
+        """
+        通过参数字典创建智能体并自动绑定匹配的仿真器。
+
+        内部调用 :func:`create_simulator` 根据 ``params`` 的内容自动选择
+        :class:`AcousticSimulator`、:class:`RoomAcousticSimulator` 或
+        :class:`BeamformingSimulator`，无需手动判断。
+
+        参数
+        ----
+        position : array-like
+            智能体初始位置 ``(x, y)``（单位：米）。
+        params : dict
+            仿真参数，与 :func:`create_simulator` 接受的格式相同。
+        name : str, optional
+            智能体名称，默认为 ``"Agent"``。
+
+        返回
+        ----
+        AcousticAgent
+            已绑定仿真器的智能体实例。
+
+        示例
+        ----
+        >>> # 自动使用房间声学模型
+        >>> agent = AcousticAgent.from_params(
+        ...     position=[5.0, 4.0],
+        ...     params={"room_size": (10.0, 8.0), "boundary_type": "reflecting"},
+        ... )
+        >>> isinstance(agent.simulator, RoomAcousticSimulator)
+        True
+        """
+        agent = cls(position=np.array(position, dtype=float), name=name)
+        simulator = create_simulator(params)
+        agent.attach(simulator)
+        return agent
+
+    def attach(self, simulator: 'BaseAcousticSimulator') -> None:
         """将智能体绑定到仿真器"""
         self.simulator = simulator
 
@@ -800,21 +993,29 @@ class AcousticAgent:
         """
         感知当前位置的声场状态
 
+        对于不支持声压场的仿真器（如 BeamformingSimulator），
+        pressure 和 spl 均返回 0.0，time 返回 0.0。
+
         返回:
             包含 position / pressure / spl / time 的字典
         """
         if self.simulator is None:
             return {}
         self.perceived_pressure = self.simulator.get_pressure_at_point(self.position)
-        # 将位置裁剪到有效网格范围，防止越界
-        x = int(np.clip(self.position[0] / self.simulator.dx, 0, self.simulator.nx - 1))
-        y = int(np.clip(self.position[1] / self.simulator.dy, 0, self.simulator.ny - 1))
-        self.perceived_spl = self.simulator.compute_spl((x, y))
+        # compute_spl / dx / nx 仅 AcousticSimulator 及其子类有效
+        if isinstance(self.simulator, AcousticSimulator):
+            x = int(np.clip(self.position[0] / self.simulator.dx, 0, self.simulator.nx - 1))
+            y = int(np.clip(self.position[1] / self.simulator.dy, 0, self.simulator.ny - 1))
+            self.perceived_spl = self.simulator.compute_spl((x, y))
+            current_time: float = self.simulator.current_time
+        else:
+            self.perceived_spl = 0.0
+            current_time = 0.0
         return {
             'position': self.position.copy(),
             'pressure': self.perceived_pressure,
             'spl': self.perceived_spl,
-            'time': self.simulator.current_time,
+            'time': current_time,
         }
 
     def move(self, new_position: np.ndarray) -> None:
@@ -828,7 +1029,7 @@ class AcousticAgent:
             'type': 'move',
             'from': self.position.copy(),
             'to': new_position.copy(),
-            'time': self.simulator.current_time if self.simulator else 0.0,
+            'time': self.simulator.current_time if isinstance(self.simulator, AcousticSimulator) else 0.0,
         })
         self.position = new_position
         if self._sound_source is not None:
@@ -850,6 +1051,11 @@ class AcousticAgent:
         """
         if self.simulator is None:
             raise RuntimeError("Agent not attached to a simulator. Call attach() first.")
+        if not isinstance(self.simulator, AcousticSimulator):
+            raise RuntimeError(
+                "emit_sound() requires an AcousticSimulator (or subclass). "
+                f"Current simulator is {type(self.simulator).__name__}."
+            )
         if self._sound_source is None:
             self._sound_source = SoundSource(
                 position=self.position.copy(),
@@ -867,7 +1073,7 @@ class AcousticAgent:
             'type': 'emit',
             'frequency': frequency,
             'amplitude': amplitude,
-            'time': self.simulator.current_time,
+            'time': self.simulator.current_time if isinstance(self.simulator, AcousticSimulator) else 0.0,
         })
         return self._sound_source
 
@@ -877,7 +1083,7 @@ class AcousticAgent:
             self._sound_source.active = False
             self.action_history.append({
                 'type': 'silence',
-                'time': self.simulator.current_time if self.simulator else 0.0,
+                'time': self.simulator.current_time if isinstance(self.simulator, AcousticSimulator) else 0.0,
             })
 
 
