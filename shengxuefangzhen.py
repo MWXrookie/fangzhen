@@ -14,7 +14,18 @@ Acoustic Simulation Engine Based on Agent
 - AcousticAgent 智能体（感知 / 移动 / 发声）
 """
 
+import json
+import os
+import warnings
+
 import numpy as np
+import matplotlib
+# 在无头环境（无 DISPLAY/WAYLAND）下自动切换到非交互式 Agg 后端，
+# 避免 "cannot connect to display" 错误。Windows 始终有 GUI，无需切换。
+if (os.name != 'nt'
+        and not os.environ.get('DISPLAY')
+        and not os.environ.get('WAYLAND_DISPLAY')):
+    matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from matplotlib.colors import LinearSegmentedColormap
@@ -23,9 +34,10 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Deque, Dict, List, Optional, Tuple, Union
 from enum import Enum
-import warnings
 
-warnings.filterwarnings('ignore')
+# 只屏蔽已知无害的第三方库内部警告，保留业务逻辑（CFL、数值稳定性）相关警告
+warnings.filterwarnings('ignore', category=DeprecationWarning, module='matplotlib')
+warnings.filterwarnings('ignore', category=UserWarning, module='matplotlib')
 
 
 class SoundSourceType(Enum):
@@ -128,8 +140,8 @@ class Obstacle:
 class AcousticConfig:
     """声学仿真配置"""
     sample_rate: int = 2000              # 采样率
-    grid_resolution: Tuple[int, int] = (200, 200)  # 网格分辨率
-    spatial_domain: Tuple[float, float] = (10.0, 10.0)  # 空间域 (m)
+    grid_resolution: Union[Tuple[int, int], Tuple[int, int, int]] = (200, 200)  # 网格分辨率（2D或3D）
+    spatial_domain: Union[Tuple[float, float], Tuple[float, float, float]] = (10.0, 10.0)  # 空间域 (m)
     time_step: float = 0.001             # 时间步长 (s)
     total_time: float = 2.0               # 总仿真时间 (s)
     cfl_number: float = 0.5               # CFL稳定性条件数
@@ -143,6 +155,66 @@ class AcousticConfig:
             inferred_sample_rate = int(round(1.0 / self.time_step))
             if inferred_sample_rate > 0 and self.sample_rate != inferred_sample_rate:
                 self.sample_rate = inferred_sample_rate
+
+    # ------------------------------------------------------------------
+    # JSON 序列化 / 反序列化
+    # ------------------------------------------------------------------
+
+    def to_json(self, path: str) -> None:
+        """将配置保存为 JSON 文件。
+
+        material 字段序列化为介质名称字符串（如 "空气"），
+        可被 :meth:`from_json` 正确还原。
+        """
+        data: Dict = {
+            'sample_rate': self.sample_rate,
+            'grid_resolution': list(self.grid_resolution),
+            'spatial_domain': list(self.spatial_domain),
+            'time_step': self.time_step,
+            'total_time': self.total_time,
+            'cfl_number': self.cfl_number,
+            'boundary_type': self.boundary_type,
+            'damping': self.damping,
+            'material': self.material.name,
+        }
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+    @classmethod
+    def from_json(cls, path: str) -> 'AcousticConfig':
+        """从 JSON 文件加载配置，返回 :class:`AcousticConfig` 实例。
+
+        ``material`` 字段支持介质名称字符串（如 "空气"、"water"），
+        或直接省略（使用默认空气介质）。
+        """
+        with open(path, 'r', encoding='utf-8') as f:
+            data: Dict = json.load(f)
+
+        # 还原 material 字段
+        _name_to_medium = {m.value: m for m in MediumType}
+        _chinese_to_medium = {
+            '空气': MediumType.AIR,
+            '水': MediumType.WATER,
+            '混凝土': MediumType.CONCRETE,
+            '木材': MediumType.WOOD,
+            '玻璃': MediumType.GLASS,
+        }
+        if 'material' in data:
+            raw = data.pop('material')
+            medium = (
+                _chinese_to_medium.get(raw)
+                or _name_to_medium.get(str(raw).lower())
+            )
+            data['material'] = MaterialProperties.get_material(
+                medium if medium is not None else MediumType.AIR
+            )
+
+        # tuple 字段还原
+        for key in ('grid_resolution', 'spatial_domain'):
+            if key in data:
+                data[key] = tuple(data[key])
+
+        return cls(**data)
 
 
 class BaseAcousticSimulator(ABC):
@@ -499,6 +571,33 @@ class AcousticSimulator(BaseAcousticSimulator):
             return self.pressure[px, py]
         return 0.0
 
+    # ------------------------------------------------------------------
+    # 结果导出
+    # ------------------------------------------------------------------
+
+    def export_pressure_npy(self, path: str) -> None:
+        """将当前声压场保存为 NumPy .npy 文件（形状: [nx, ny]）。
+
+        可用 ``np.load(path)`` 读取。
+        """
+        np.save(path, self.pressure)
+
+    def export_pressure_csv(self, path: str) -> None:
+        """将当前声压场保存为 CSV 文件（行=x 轴，列=y 轴）。
+
+        可用 ``np.loadtxt(path, delimiter=',')`` 读取。
+        """
+        np.savetxt(path, self.pressure, delimiter=',')
+
+    def export_history_npy(self, path: str) -> None:
+        """将完整仿真历史保存为 NumPy .npy 文件（形状: [帧数, nx, ny]）。
+
+        若历史为空则写出一个零维数组。
+        可用 ``np.load(path)`` 读取。
+        """
+        frames = np.stack(list(self.history)) if self.history else np.empty((0, self.nx, self.ny))
+        np.save(path, frames)
+
 
 class AcousticVisualizer:
     """
@@ -657,6 +756,73 @@ class AcousticVisualizer:
         plt.tight_layout()
         plt.show()
 
+    # ------------------------------------------------------------------
+    # 图形 / 动画保存
+    # ------------------------------------------------------------------
+
+    def save_figure(self, path: str, dpi: int = 150) -> None:
+        """将当前图形保存到文件。
+
+        支持 PNG、PDF、SVG 等 matplotlib 支持的所有格式，
+        格式由 ``path`` 文件后缀决定。
+
+        参数
+        ----
+        path : str
+            输出文件路径，例如 ``"result.png"`` 或 ``"result.pdf"``。
+        dpi : int
+            图像分辨率（点每英寸），默认 150。
+
+        异常
+        ----
+        RuntimeError
+            若尚未创建图形（未调用 :meth:`plot_static` 或 :meth:`setup_figure`）。
+        """
+        if self.fig is None:
+            raise RuntimeError("No figure to save. Call plot_static() first.")
+        self.fig.savefig(path, bbox_inches='tight', dpi=dpi)
+
+    def save_animation_gif(self, path: str, fps: int = 20) -> None:
+        """将仿真历史保存为 GIF 动画文件（需安装 pillow）。
+
+        参数
+        ----
+        path : str
+            输出 GIF 文件路径，例如 ``"animation.gif"``。
+        fps : int
+            帧率，默认 20。
+        """
+        if not self.simulator.history:
+            raise RuntimeError("No simulation history available. Run simulate() first.")
+        if self.fig is None:
+            self.setup_figure()
+
+        def _update(frame: int) -> None:
+            if frame < len(self.simulator.history):
+                pressure = self.simulator.history[frame]
+                self.ax[0].clear()
+                self.ax[0].imshow(
+                    pressure.T,
+                    extent=[0, self.simulator.config.spatial_domain[0],
+                            0, self.simulator.config.spatial_domain[1]],
+                    cmap=self.cmap,
+                    origin='lower',
+                    aspect='auto',
+                    vmin=-0.5,
+                    vmax=0.5,
+                )
+                self.ax[0].set_title(f'声压场 t = {frame * self.simulator.dt:.3f}s')
+                self.ax[0].set_xlabel('X (m)')
+                self.ax[0].set_ylabel('Y (m)')
+
+        anim = FuncAnimation(
+            self.fig, _update,
+            frames=len(self.simulator.history),
+            interval=1000 // fps,
+            repeat=False,
+        )
+        anim.save(path, writer='pillow', fps=fps)
+
 
 class RoomAcousticSimulator(AcousticSimulator):
     """
@@ -726,6 +892,546 @@ class RoomAcousticSimulator(AcousticSimulator):
                 return rt60
                 
         return 0.0
+
+
+class AcousticSimulator3D(BaseAcousticSimulator):
+    """
+    3D声学仿真引擎
+
+    实现三维波动方程 ∂²p/∂t² = c²∇²p 的显式有限差分（FDTD）求解。
+
+    相比2D版本的主要差异:
+
+    - 声压场形状: ``(nx, ny, nz)``
+    - 拉普拉斯算子增加 z 方向差分项
+    - 边界条件（PML / 反射 / 周期）扩展至6个面
+    - CFL稳定性判断: ``c·dt·√(1/dx²+1/dy²+1/dz²) ≤ cfl_number``
+    - 历史帧上限默认50帧（3D数据量大，节省内存）
+
+    内存估算（float64）:
+    - 50³ 网格约 70 MB（含50帧历史）
+    - 100³ 网格约 500 MB（含50帧历史，视机器内存酌情减小）
+
+    用法示例::
+
+        config = AcousticConfig(
+            grid_resolution=(50, 50, 50),
+            spatial_domain=(5.0, 5.0, 5.0),
+            time_step=0.0001,
+            total_time=0.05,
+            boundary_type="absorbing",
+        )
+        sim = AcousticSimulator3D(config)
+        src = SoundSource(position=np.array([2.5, 2.5, 2.5]), frequency=200.0, amplitude=1.0)
+        sim.add_source(src)
+        sim.simulate()
+    """
+
+    def __init__(self, config: AcousticConfig):
+        if len(config.grid_resolution) != 3 or len(config.spatial_domain) != 3:
+            raise ValueError(
+                "AcousticSimulator3D 需要三元组 grid_resolution 和 spatial_domain，"
+                f"当前值: grid_resolution={config.grid_resolution}, "
+                f"spatial_domain={config.spatial_domain}"
+            )
+
+        self.config = config
+        self.nx, self.ny, self.nz = config.grid_resolution
+        self.dx = config.spatial_domain[0] / self.nx
+        self.dy = config.spatial_domain[1] / self.ny
+        self.dz = config.spatial_domain[2] / self.nz
+        self.dt = config.time_step
+        self.c = config.material.speed_of_sound
+
+        # CFL 稳定性检查
+        self._check_cfl_condition()
+
+        # 声压场（current / previous / next）
+        shape = (self.nx, self.ny, self.nz)
+        self.pressure: np.ndarray = np.zeros(shape)
+        self.pressure_prev: np.ndarray = np.zeros(shape)
+        self.pressure_next: np.ndarray = np.zeros(shape)
+
+        self.sources: List[SoundSource] = []
+        self.obstacles: List[Obstacle] = []
+
+        self.obstacle_mask: np.ndarray = np.zeros(shape)
+        self.absorption_mask: np.ndarray = np.zeros(shape)
+        self.reflection_coeff: np.ndarray = np.ones(shape)
+
+        self.current_time: float = 0.0
+        self.time_steps: int = 0
+
+        # 3D 历史数据量大，缩小缓冲区
+        self.max_history: int = 50
+        self.history: Deque[np.ndarray] = deque(maxlen=self.max_history)
+
+        # 预计算网格坐标（避免每步重复 meshgrid）
+        self._grid_x, self._grid_y, self._grid_z = np.meshgrid(
+            np.arange(self.nx), np.arange(self.ny), np.arange(self.nz),
+            indexing='ij',
+        )
+
+    def _check_cfl_condition(self) -> None:
+        """检查3D CFL稳定性条件"""
+        cfl = self.c * self.dt * np.sqrt(
+            1.0 / self.dx ** 2 + 1.0 / self.dy ** 2 + 1.0 / self.dz ** 2
+        )
+        if cfl > self.config.cfl_number:
+            print(f"警告: 3D CFL数 {cfl:.3f} 超过设定值 {self.config.cfl_number}")
+            print("调整时间步长以满足稳定性条件...")
+            max_dt = self.config.cfl_number / (
+                self.c * np.sqrt(1.0 / self.dx ** 2 + 1.0 / self.dy ** 2 + 1.0 / self.dz ** 2)
+            )
+            self.dt = max_dt * 0.9
+            self.config.time_step = self.dt
+            self.config.sample_rate = int(round(1.0 / self.dt))
+            print(f"新时间步长: {self.dt:.6f} s")
+
+    def add_source(self, source: SoundSource) -> None:
+        """添加声源"""
+        self.sources.append(source)
+
+    def add_obstacle(self, obstacle: Obstacle) -> None:
+        """添加障碍物"""
+        self.obstacles.append(obstacle)
+        self._update_obstacle_masks()
+
+    def _update_obstacle_masks(self) -> None:
+        """更新障碍物掩码（3D AABB）"""
+        self.obstacle_mask.fill(0)
+        self.absorption_mask.fill(0)
+        self.reflection_coeff.fill(1.0)
+
+        for obs in self.obstacles:
+            pos = obs.position
+            half = obs.size / 2
+
+            x_min = max(0, int((pos[0] - half[0]) / self.dx))
+            x_max = min(self.nx, int((pos[0] + half[0]) / self.dx))
+            y_min = max(0, int((pos[1] - half[1]) / self.dy))
+            y_max = min(self.ny, int((pos[1] + half[1]) / self.dy))
+            # z 坐标：若障碍物只有 2D 尺寸则占满整个 z 域
+            z_min = max(0, int((pos[2] - half[2]) / self.dz)) if len(pos) > 2 and len(obs.size) > 2 else 0
+            z_max = min(self.nz, int((pos[2] + half[2]) / self.dz)) if len(pos) > 2 and len(obs.size) > 2 else self.nz
+
+            if x_max > x_min and y_max > y_min and z_max > z_min:
+                sl = (slice(x_min, x_max), slice(y_min, y_max), slice(z_min, z_max))
+                self.obstacle_mask[sl] = 1
+                if obs.is_absorbing:
+                    self.absorption_mask[sl] = obs.material.absorption_coeff
+                    self.reflection_coeff[sl] = 1.0 - obs.material.absorption_coeff
+                elif obs.is_reflecting:
+                    self.reflection_coeff[sl] = 1.0 - obs.material.scattering_coeff
+
+    def _apply_source_excitation(self) -> None:
+        """施加声源激励（3D）"""
+        for source in self.sources:
+            if not source.active:
+                continue
+
+            px = int(source.position[0] / self.dx)
+            py = int(source.position[1] / self.dy)
+            pz = int(source.position[2] / self.dz) if len(source.position) > 2 else self.nz // 2
+
+            if not (0 <= px < self.nx and 0 <= py < self.ny and 0 <= pz < self.nz):
+                continue
+
+            if source.source_type == SoundSourceType.POINT:
+                signal = source.get_wave_packet(self.current_time)
+                self.pressure[px, py, pz] += signal
+
+            elif source.source_type == SoundSourceType.LINE:
+                signal = source.get_signal(self.current_time)
+                if source.direction is not None:
+                    d = source.direction
+                    d0, d1 = d[0], d[1]
+                    d2 = d[2] if len(d) > 2 else 0.0
+                    # 点到直线的垂直距离（叉积法，逐分量计算避免大临时数组）
+                    gx = self._grid_x - px
+                    gy = self._grid_y - py
+                    gz = self._grid_z - pz
+                    cx = gy * d2 - gz * d1
+                    cy = gz * d0 - gx * d2
+                    cz = gx * d1 - gy * d0
+                    perp_dist = np.sqrt(cx ** 2 + cy ** 2 + cz ** 2)
+                    self.pressure[perp_dist < 0.5] += signal
+                else:
+                    # 默认：沿 z 轴的线声源
+                    self.pressure[px, py, :] += signal
+
+            elif source.source_type == SoundSourceType.DIRECTIONAL:
+                signal = source.get_wave_packet(self.current_time)
+                self.pressure[px, py, pz] += signal
+                if source.direction is not None:
+                    d = source.direction
+                    d0, d1 = d[0], d[1]
+                    d2 = d[2] if len(d) > 2 else 0.0
+                    fwd = (int(round(px + d0)), int(round(py + d1)), int(round(pz + d2)))
+                    bwd = (int(round(px - d0)), int(round(py - d1)), int(round(pz - d2)))
+                    dims = (self.nx, self.ny, self.nz)
+                    if all(0 <= fwd[i] < dims[i] for i in range(3)):
+                        self.pressure[fwd[0], fwd[1], fwd[2]] += signal * 0.5
+                    if all(0 <= bwd[i] < dims[i] for i in range(3)):
+                        self.pressure[bwd[0], bwd[1], bwd[2]] -= signal * 0.5
+
+            elif source.source_type == SoundSourceType.PLANE:
+                signal = source.get_wave_packet(self.current_time)
+                if source.direction is not None:
+                    d = source.direction
+                    d0, d1 = d[0], d[1]
+                    d2 = d[2] if len(d) > 2 else 0.0
+                    # 点到平面的有符号距离
+                    proj = (
+                        (self._grid_x - px) * d0
+                        + (self._grid_y - py) * d1
+                        + (self._grid_z - pz) * d2
+                    )
+                    self.pressure[np.abs(proj) < 0.5] += signal
+                else:
+                    # 默认：激励 z = pz 截面
+                    self.pressure[:, :, pz] += signal
+
+    def _apply_boundary_conditions(self, target_field: Optional[np.ndarray] = None) -> None:
+        """应用3D边界条件"""
+        if target_field is None:
+            target_field = self.pressure_next
+        nx, ny, nz = self.nx, self.ny, self.nz
+
+        if self.config.boundary_type == "absorbing":
+            pml_width = min(10, nx // 4, ny // 4, nz // 4)
+            sigma = np.zeros((nx, ny, nz))
+            ramp = np.linspace(0, 1, pml_width) * 2  # 强度 0 → 2
+
+            # X 面
+            sigma[:pml_width, :, :] = np.maximum(
+                sigma[:pml_width, :, :], ramp[:, np.newaxis, np.newaxis])
+            sigma[-pml_width:, :, :] = np.maximum(
+                sigma[-pml_width:, :, :], ramp[::-1, np.newaxis, np.newaxis])
+            # Y 面
+            sigma[:, :pml_width, :] = np.maximum(
+                sigma[:, :pml_width, :], ramp[np.newaxis, :, np.newaxis])
+            sigma[:, -pml_width:, :] = np.maximum(
+                sigma[:, -pml_width:, :], ramp[np.newaxis, ::-1, np.newaxis])
+            # Z 面
+            sigma[:, :, :pml_width] = np.maximum(
+                sigma[:, :, :pml_width], ramp[np.newaxis, np.newaxis, :])
+            sigma[:, :, -pml_width:] = np.maximum(
+                sigma[:, :, -pml_width:], ramp[np.newaxis, np.newaxis, ::-1])
+
+            target_field *= np.exp(-sigma * self.config.damping)
+
+        elif self.config.boundary_type == "reflecting":
+            target_field[0, :, :] = target_field[1, :, :]
+            target_field[-1, :, :] = target_field[-2, :, :]
+            target_field[:, 0, :] = target_field[:, 1, :]
+            target_field[:, -1, :] = target_field[:, -2, :]
+            target_field[:, :, 0] = target_field[:, :, 1]
+            target_field[:, :, -1] = target_field[:, :, -2]
+
+        elif self.config.boundary_type == "periodic":
+            target_field[0, :, :] = target_field[-2, :, :]
+            target_field[-1, :, :] = target_field[1, :, :]
+            target_field[:, 0, :] = target_field[:, -2, :]
+            target_field[:, -1, :] = target_field[:, 1, :]
+            target_field[:, :, 0] = target_field[:, :, -2]
+            target_field[:, :, -1] = target_field[:, :, 1]
+
+    def _apply_obstacle_conditions(self, target_field: Optional[np.ndarray] = None) -> None:
+        """障碍物区域设为零（硬边界）"""
+        if target_field is None:
+            target_field = self.pressure_next
+        target_field[self.obstacle_mask > 0] = 0
+
+    def _finite_difference_step(self) -> None:
+        """3D有限差分一步计算"""
+        c2 = self.c ** 2
+        dt2 = self.dt ** 2
+        dx2 = self.dx ** 2
+        dy2 = self.dy ** 2
+        dz2 = self.dz ** 2
+
+        self.pressure_next.fill(0.0)
+
+        # 3D 拉普拉斯算子（内部点 [1:-1, 1:-1, 1:-1]）
+        p = self.pressure
+        laplacian = (
+            (p[2:, 1:-1, 1:-1] - 2 * p[1:-1, 1:-1, 1:-1] + p[:-2, 1:-1, 1:-1]) / dx2
+            + (p[1:-1, 2:, 1:-1] - 2 * p[1:-1, 1:-1, 1:-1] + p[1:-1, :-2, 1:-1]) / dy2
+            + (p[1:-1, 1:-1, 2:] - 2 * p[1:-1, 1:-1, 1:-1] + p[1:-1, 1:-1, :-2]) / dz2
+        )
+
+        self.pressure_next[1:-1, 1:-1, 1:-1] = (
+            2 * p[1:-1, 1:-1, 1:-1]
+            - self.pressure_prev[1:-1, 1:-1, 1:-1]
+            + c2 * dt2 * laplacian
+        )
+
+        self.pressure_next[1:-1, 1:-1, 1:-1] *= (1 - self.config.damping)
+        self.pressure_next[1:-1, 1:-1, 1:-1] *= self.reflection_coeff[1:-1, 1:-1, 1:-1]
+
+    def step(self) -> bool:
+        """执行一步仿真，返回是否继续"""
+        self._apply_source_excitation()
+        self._finite_difference_step()
+        self._apply_boundary_conditions(self.pressure_next)
+        self._apply_obstacle_conditions(self.pressure_next)
+
+        self.pressure_prev = self.pressure.copy()
+        self.pressure = self.pressure_next.copy()
+
+        self.current_time += self.dt
+        self.time_steps += 1
+        self.history.append(self.pressure.copy())
+
+        return self.current_time < self.config.total_time
+
+    def simulate(self) -> np.ndarray:
+        """运行完整仿真，返回最终声压场（形状: [nx, ny, nz]）"""
+        while self.step():
+            pass
+        return self.pressure
+
+    def get_snapshot(self, time_index: int) -> Optional[np.ndarray]:
+        """获取历史中指定帧的声场快照"""
+        if 0 <= time_index < len(self.history):
+            return self.history[time_index]
+        return None
+
+    def compute_frequency_spectrum(
+        self, position: Tuple[int, int, int]
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        计算指定网格位置的频谱
+
+        参数
+        ----
+        position : tuple[int, int, int]
+            网格索引 (ix, iy, iz)
+
+        返回
+        ----
+        (frequencies, amplitudes)
+        """
+        if len(self.history) < 10:
+            return np.array([]), np.array([])
+        x, y, z = position
+        if not (0 <= x < self.nx and 0 <= y < self.ny and 0 <= z < self.nz):
+            return np.array([]), np.array([])
+        pressure_time = np.array([h[x, y, z] for h in self.history])
+        n = len(pressure_time)
+        fft_result = np.fft.fft(pressure_time)
+        frequencies = np.fft.fftfreq(n, self.dt)[:n // 2]
+        amplitudes = np.abs(fft_result)[:n // 2] * 2 / n
+        return frequencies, amplitudes
+
+    def compute_spl(self, position: Tuple[int, int, int]) -> float:
+        """
+        计算指定网格位置的声压级 (dB SPL)
+
+        参数
+        ----
+        position : tuple[int, int, int]
+            网格索引 (ix, iy, iz)
+        """
+        if len(self.history) < 10:
+            return 0.0
+        x, y, z = position
+        if not (0 <= x < self.nx and 0 <= y < self.ny and 0 <= z < self.nz):
+            return 0.0
+        pressure_rms = np.sqrt(np.mean([h[x, y, z] ** 2 for h in self.history]))
+        if pressure_rms > 0:
+            spl = 20 * np.log10(pressure_rms / 2e-5)
+            return max(0.0, spl)
+        return 0.0
+
+    def get_pressure_at_point(self, position: np.ndarray) -> float:
+        """获取指定物理位置的瞬时声压"""
+        px = int(position[0] / self.dx)
+        py = int(position[1] / self.dy)
+        pz = int(position[2] / self.dz) if len(position) > 2 else self.nz // 2
+        if 0 <= px < self.nx and 0 <= py < self.ny and 0 <= pz < self.nz:
+            return self.pressure[px, py, pz]
+        return 0.0
+
+    # ------------------------------------------------------------------
+    # 结果导出
+    # ------------------------------------------------------------------
+
+    def export_pressure_npy(self, path: str) -> None:
+        """将当前声压场保存为 .npy 文件（形状: [nx, ny, nz]）"""
+        np.save(path, self.pressure)
+
+    def export_history_npy(self, path: str) -> None:
+        """将完整仿真历史保存为 .npy 文件（形状: [帧数, nx, ny, nz]）"""
+        frames = (
+            np.stack(list(self.history))
+            if self.history
+            else np.empty((0, self.nx, self.ny, self.nz))
+        )
+        np.save(path, frames)
+
+
+class AcousticVisualizer3D:
+    """
+    3D声学仿真可视化器
+
+    通过三个正交截面（XY / XZ / YZ 平面）直观展示三维声压场。
+    每个子图中截面位置可自由指定，默认取各轴中心。
+
+    用法示例::
+
+        viz = AcousticVisualizer3D(sim3d)
+        viz.setup_figure()
+        viz.plot_slices("3D声压场")
+        viz.save_figure("result3d.png")
+    """
+
+    def __init__(self, simulator: AcousticSimulator3D):
+        self.simulator = simulator
+        self.fig = None
+        self.axes = None
+        self.cmap = LinearSegmentedColormap.from_list(
+            'acoustic',
+            ['#0000FF', '#00FFFF', '#00FF00', '#FFFF00', '#FF0000'],
+        )
+
+    def setup_figure(self, figsize: Tuple[int, int] = (15, 5)) -> None:
+        """创建含三个截面子图的画布"""
+        self.fig, self.axes = plt.subplots(1, 3, figsize=figsize)
+
+    def plot_slices(
+        self,
+        title: str = "3D声压场截面",
+        slice_x: Optional[int] = None,
+        slice_y: Optional[int] = None,
+        slice_z: Optional[int] = None,
+        vmin: Optional[float] = None,
+        vmax: Optional[float] = None,
+    ) -> None:
+        """
+        绘制三个正交截面
+
+        参数
+        ----
+        title : str
+            总标题
+        slice_x, slice_y, slice_z : int, optional
+            各轴截面的网格索引，默认取各轴中点
+        vmin, vmax : float, optional
+            颜色范围。默认以场最大绝对值对称映射
+        """
+        if self.fig is None:
+            self.setup_figure()
+
+        sim = self.simulator
+        sx = slice_x if slice_x is not None else sim.nx // 2
+        sy = slice_y if slice_y is not None else sim.ny // 2
+        sz = slice_z if slice_z is not None else sim.nz // 2
+
+        p_abs_max = float(np.max(np.abs(sim.pressure)))
+        vm = p_abs_max if p_abs_max > 1e-12 else 1.0
+        if vmin is not None and vmax is not None:
+            vm = max(abs(vmin), abs(vmax))
+
+        sdx, sdy, sdz = sim.config.spatial_domain
+        slice_specs = [
+            (
+                f"XY截面 (iz={sz})",
+                sim.pressure[:, :, sz].T,
+                [0, sdx, 0, sdy],
+                'X (m)', 'Y (m)',
+            ),
+            (
+                f"XZ截面 (iy={sy})",
+                sim.pressure[:, sy, :].T,
+                [0, sdx, 0, sdz],
+                'X (m)', 'Z (m)',
+            ),
+            (
+                f"YZ截面 (ix={sx})",
+                sim.pressure[sx, :, :].T,
+                [0, sdy, 0, sdz],
+                'Y (m)', 'Z (m)',
+            ),
+        ]
+
+        for ax, (subtitle, data, extent, xlabel, ylabel) in zip(self.axes, slice_specs):
+            ax.clear()
+            im = ax.imshow(
+                data,
+                extent=extent,
+                cmap=self.cmap,
+                origin='lower',
+                aspect='auto',
+                vmin=-vm,
+                vmax=vm,
+            )
+            ax.set_xlabel(xlabel)
+            ax.set_ylabel(ylabel)
+            ax.set_title(subtitle)
+            plt.colorbar(im, ax=ax, label='声压 (Pa)')
+
+        self.fig.suptitle(title)
+        plt.tight_layout()
+
+    def save_figure(self, path: str, dpi: int = 150) -> None:
+        """将当前截面图保存到文件（PNG / PDF / SVG 等）
+
+        异常
+        ----
+        RuntimeError
+            尚未调用 :meth:`plot_slices` 或 :meth:`setup_figure`
+        """
+        if self.fig is None:
+            raise RuntimeError("No figure to save. Call plot_slices() first.")
+        self.fig.savefig(path, bbox_inches='tight', dpi=dpi)
+
+    def save_animation_gif(self, path: str, fps: int = 10) -> None:
+        """将仿真历史以三截面动画形式保存为 GIF（需安装 pillow）
+
+        参数
+        ----
+        path : str
+            输出 GIF 路径
+        fps : int
+            帧率（3D数据量较大，默认10fps）
+        """
+        if not self.simulator.history:
+            raise RuntimeError("No simulation history available. Run simulate() first.")
+        if self.fig is None:
+            self.setup_figure()
+
+        sim = self.simulator
+        sx, sy, sz = sim.nx // 2, sim.ny // 2, sim.nz // 2
+        sdx, sdy, sdz = sim.config.spatial_domain
+
+        def _update(frame: int) -> None:
+            if frame >= len(sim.history):
+                return
+            p = sim.history[frame]
+            p_max = float(np.max(np.abs(p)))
+            vm = p_max if p_max > 1e-12 else 1.0
+            specs = [
+                (p[:, :, sz].T, [0, sdx, 0, sdy], f"XY (iz={sz})"),
+                (p[:, sy, :].T, [0, sdx, 0, sdz], f"XZ (iy={sy})"),
+                (p[sx, :, :].T, [0, sdy, 0, sdz], f"YZ (ix={sx})"),
+            ]
+            for ax, (data, extent, subtitle) in zip(self.axes, specs):
+                ax.clear()
+                ax.imshow(
+                    data, extent=extent, cmap=self.cmap,
+                    origin='lower', aspect='auto', vmin=-vm, vmax=vm,
+                )
+                ax.set_title(f"{subtitle}  t={frame * sim.dt:.4f}s")
+
+        anim = FuncAnimation(
+            self.fig, _update,
+            frames=len(sim.history),
+            interval=1000 // fps,
+            repeat=False,
+        )
+        anim.save(path, writer='pillow', fps=fps)
 
 
 class BeamformingSimulator(BaseAcousticSimulator):
@@ -880,23 +1586,39 @@ def create_simulator(params: dict) -> BaseAcousticSimulator:
         return BeamformingSimulator(array_config)
 
     # ── 共用：从 params 构建 AcousticConfig ─────────────────────────────
-    spatial_domain: Tuple[float, float] = params.get('spatial_domain', (10.0, 10.0))
+    spatial_domain = params.get('spatial_domain', (10.0, 10.0))
+    is_3d: bool = len(spatial_domain) == 3  # 由 spatial_domain 长度决定是否使用3D
     speed_of_sound: float = params.get('speed_of_sound', 343.0)
 
     # 自动推算网格分辨率（高频场景，且用户未显式指定时）
     if 'grid_resolution' not in params:
         max_freq: float = params.get('max_frequency', params.get('frequency', 440.0))
-        if max_freq > 1000.0:
-            min_wavelength = speed_of_sound / max_freq
-            # 每个波长至少 10 个网格点（采样定理安全余量）
-            recommended_dx = min_wavelength / 10.0
-            recommended_nx = max(100, int(spatial_domain[0] / recommended_dx))
-            recommended_ny = max(100, int(spatial_domain[1] / recommended_dx))
-            grid_resolution: Tuple[int, int] = (recommended_nx, recommended_ny)
+        if is_3d:
+            # 3D 默认精细网格较小，避免内存爆炸
+            if max_freq > 1000.0:
+                min_wavelength = speed_of_sound / max_freq
+                recommended_dx = min_wavelength / 10.0
+                recommended_n = max(30, int(max(spatial_domain) / recommended_dx))
+                nx3 = max(30, int(spatial_domain[0] / recommended_dx))
+                ny3 = max(30, int(spatial_domain[1] / recommended_dx))
+                nz3 = max(30, int(spatial_domain[2] / recommended_dx))
+                grid_resolution = (nx3, ny3, nz3)
+            else:
+                grid_resolution = (50, 50, 50)
         else:
-            grid_resolution = (200, 200)
+            if max_freq > 1000.0:
+                min_wavelength = speed_of_sound / max_freq
+                recommended_dx = min_wavelength / 10.0
+                recommended_nx = max(100, int(spatial_domain[0] / recommended_dx))
+                recommended_ny = max(100, int(spatial_domain[1] / recommended_dx))
+                grid_resolution = (recommended_nx, recommended_ny)
+            else:
+                grid_resolution = (200, 200)
     else:
         grid_resolution = params['grid_resolution']
+        # 若用户传入3元组 grid_resolution 也自动切到3D
+        if len(grid_resolution) == 3:
+            is_3d = True
 
     # 仅提取 AcousticConfig 合法字段
     _CONFIG_KEYS = {'sample_rate', 'time_step', 'total_time', 'cfl_number',
@@ -908,12 +1630,16 @@ def create_simulator(params: dict) -> BaseAcousticSimulator:
 
     config = AcousticConfig(**config_kwargs)
 
-    # ── 2. 房间声学 ──────────────────────────────────────────────────────
+    # ── 2. 3D 仿真 ───────────────────────────────────────────────────────
+    if is_3d:
+        return AcousticSimulator3D(config)
+
+    # ── 3. 房间声学 ──────────────────────────────────────────────────────
     if 'room_size' in params or 'walls' in params:
-        room_size: Tuple[float, float] = params.get('room_size', spatial_domain)
+        room_size = params.get('room_size', spatial_domain)
         return RoomAcousticSimulator(config, room_size=room_size)
 
-    # ── 3 & 4. 默认 / 高频精细网格 ──────────────────────────────────────
+    # ── 4 & 5. 默认 / 高频精细网格 ──────────────────────────────────────
     return AcousticSimulator(config)
 
 
@@ -1002,12 +1728,19 @@ class AcousticAgent:
         if self.simulator is None:
             return {}
         self.perceived_pressure = self.simulator.get_pressure_at_point(self.position)
-        # compute_spl / dx / nx 仅 AcousticSimulator 及其子类有效
-        if isinstance(self.simulator, AcousticSimulator):
+        # compute_spl / current_time 在 AcousticSimulator 及 AcousticSimulator3D 中均有效
+        if isinstance(self.simulator, AcousticSimulator3D):
+            x = int(np.clip(self.position[0] / self.simulator.dx, 0, self.simulator.nx - 1))
+            y = int(np.clip(self.position[1] / self.simulator.dy, 0, self.simulator.ny - 1))
+            z_pos = self.position[2] if len(self.position) > 2 else self.simulator.config.spatial_domain[2] / 2
+            z = int(np.clip(z_pos / self.simulator.dz, 0, self.simulator.nz - 1))
+            self.perceived_spl = self.simulator.compute_spl((x, y, z))
+            current_time: float = self.simulator.current_time
+        elif isinstance(self.simulator, AcousticSimulator):
             x = int(np.clip(self.position[0] / self.simulator.dx, 0, self.simulator.nx - 1))
             y = int(np.clip(self.position[1] / self.simulator.dy, 0, self.simulator.ny - 1))
             self.perceived_spl = self.simulator.compute_spl((x, y))
-            current_time: float = self.simulator.current_time
+            current_time = self.simulator.current_time
         else:
             self.perceived_spl = 0.0
             current_time = 0.0
@@ -1025,11 +1758,12 @@ class AcousticAgent:
         如果智能体当前有声源，声源位置也会同步更新。
         """
         new_position = np.array(new_position, dtype=float)
+        _has_time = isinstance(self.simulator, (AcousticSimulator, AcousticSimulator3D))
         self.action_history.append({
             'type': 'move',
             'from': self.position.copy(),
             'to': new_position.copy(),
-            'time': self.simulator.current_time if isinstance(self.simulator, AcousticSimulator) else 0.0,
+            'time': self.simulator.current_time if _has_time else 0.0,
         })
         self.position = new_position
         if self._sound_source is not None:
@@ -1045,15 +1779,16 @@ class AcousticAgent:
         在当前位置发出声音
 
         首次调用时向仿真器注册声源；后续调用更新频率和振幅。
+        支持 2D（AcousticSimulator / RoomAcousticSimulator）和 3D（AcousticSimulator3D）仿真器。
 
         返回:
             关联的 SoundSource 实例
         """
         if self.simulator is None:
             raise RuntimeError("Agent not attached to a simulator. Call attach() first.")
-        if not isinstance(self.simulator, AcousticSimulator):
+        if not isinstance(self.simulator, (AcousticSimulator, AcousticSimulator3D)):
             raise RuntimeError(
-                "emit_sound() requires an AcousticSimulator (or subclass). "
+                "emit_sound() requires an AcousticSimulator or AcousticSimulator3D. "
                 f"Current simulator is {type(self.simulator).__name__}."
             )
         if self._sound_source is None:
@@ -1069,11 +1804,12 @@ class AcousticAgent:
             self._sound_source.amplitude = amplitude
             self._sound_source.source_type = source_type
             self._sound_source.active = True
+        _has_time = isinstance(self.simulator, (AcousticSimulator, AcousticSimulator3D))
         self.action_history.append({
             'type': 'emit',
             'frequency': frequency,
             'amplitude': amplitude,
-            'time': self.simulator.current_time if isinstance(self.simulator, AcousticSimulator) else 0.0,
+            'time': self.simulator.current_time if _has_time else 0.0,
         })
         return self._sound_source
 
@@ -1081,9 +1817,10 @@ class AcousticAgent:
         """停止当前声源"""
         if self._sound_source is not None:
             self._sound_source.active = False
+            _has_time = isinstance(self.simulator, (AcousticSimulator, AcousticSimulator3D))
             self.action_history.append({
                 'type': 'silence',
-                'time': self.simulator.current_time if isinstance(self.simulator, AcousticSimulator) else 0.0,
+                'time': self.simulator.current_time if _has_time else 0.0,
             })
 
 
@@ -1260,6 +1997,73 @@ def run_room_acoustic_example():
     visualizer = AcousticVisualizer(room_sim)
     visualizer.setup_figure()
     visualizer.plot_static("房间声学仿真")
+    plt.show()
+
+
+def run_3d_example():
+    """3D声学仿真示例
+
+    演示 AcousticSimulator3D 和 AcousticVisualizer3D 的基本用法。
+    为保证在普通机器上可运行，使用较小的 30³ 网格与短仿真时间。
+    """
+    print("\n" + "=" * 55)
+    print("声学仿真模拟器 - 3D声场仿真示例")
+    print("=" * 55)
+
+    # 配置参数：30³ 网格，3×3×3 m 空间
+    config = AcousticConfig(
+        grid_resolution=(30, 30, 30),
+        spatial_domain=(3.0, 3.0, 3.0),
+        time_step=0.00015,
+        total_time=0.015,
+        boundary_type="absorbing",
+        damping=0.02,
+    )
+
+    sim3d = AcousticSimulator3D(config)
+
+    # 中心点声源
+    src = SoundSource(
+        position=np.array([1.5, 1.5, 1.5]),
+        frequency=200.0,
+        amplitude=1.0,
+        source_type=SoundSourceType.POINT,
+    )
+    sim3d.add_source(src)
+
+    # 添加一个3D混凝土障碍物
+    wall_3d = Obstacle(
+        position=np.array([2.0, 1.5, 1.5]),
+        size=np.array([0.3, 1.2, 1.2]),
+        material=MaterialProperties.get_material(MediumType.CONCRETE),
+        is_reflecting=True,
+        is_absorbing=False,
+    )
+    sim3d.add_obstacle(wall_3d)
+
+    print(f"\n网格大小: {sim3d.nx}×{sim3d.ny}×{sim3d.nz}")
+    print(f"空间域: {config.spatial_domain} m")
+    print(f"时间步长: {sim3d.dt:.6f} s")
+    print(f"预计步数: {int(config.total_time / sim3d.dt)}")
+    print("\n运行3D仿真...")
+
+    final_pressure = sim3d.simulate()
+
+    print(f"\n仿真完成!")
+    print(f"总时间步数: {sim3d.time_steps}")
+    print(f"最终时间:   {sim3d.current_time:.4f} s")
+    print(f"声压范围:   [{final_pressure.min():.4f}, {final_pressure.max():.4f}] Pa")
+    print(f"声压 RMS:   {np.sqrt(np.mean(final_pressure**2)):.4f} Pa")
+
+    # 中心点 SPL
+    cx, cy, cz = sim3d.nx // 2, sim3d.ny // 2, sim3d.nz // 2
+    center_spl = sim3d.compute_spl((cx, cy, cz))
+    print(f"中心点 SPL: {center_spl:.1f} dB SPL")
+
+    # 可视化：三截面图
+    viz3d = AcousticVisualizer3D(sim3d)
+    viz3d.setup_figure(figsize=(15, 5))
+    viz3d.plot_slices("3D声学仿真 - 三正交截面")
     plt.show()
 
 
