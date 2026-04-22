@@ -14,7 +14,18 @@ Acoustic Simulation Engine Based on Agent
 - AcousticAgent 智能体（感知 / 移动 / 发声）
 """
 
+import json
+import os
+import warnings
+
 import numpy as np
+import matplotlib
+# 在无头环境（无 DISPLAY/WAYLAND）下自动切换到非交互式 Agg 后端，
+# 避免 "cannot connect to display" 错误。Windows 始终有 GUI，无需切换。
+if (os.name != 'nt'
+        and not os.environ.get('DISPLAY')
+        and not os.environ.get('WAYLAND_DISPLAY')):
+    matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from matplotlib.colors import LinearSegmentedColormap
@@ -23,9 +34,10 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Deque, Dict, List, Optional, Tuple, Union
 from enum import Enum
-import warnings
 
-warnings.filterwarnings('ignore')
+# 只屏蔽已知无害的第三方库内部警告，保留业务逻辑（CFL、数值稳定性）相关警告
+warnings.filterwarnings('ignore', category=DeprecationWarning, module='matplotlib')
+warnings.filterwarnings('ignore', category=UserWarning, module='matplotlib')
 
 
 class SoundSourceType(Enum):
@@ -143,6 +155,66 @@ class AcousticConfig:
             inferred_sample_rate = int(round(1.0 / self.time_step))
             if inferred_sample_rate > 0 and self.sample_rate != inferred_sample_rate:
                 self.sample_rate = inferred_sample_rate
+
+    # ------------------------------------------------------------------
+    # JSON 序列化 / 反序列化
+    # ------------------------------------------------------------------
+
+    def to_json(self, path: str) -> None:
+        """将配置保存为 JSON 文件。
+
+        material 字段序列化为介质名称字符串（如 "空气"），
+        可被 :meth:`from_json` 正确还原。
+        """
+        data: Dict = {
+            'sample_rate': self.sample_rate,
+            'grid_resolution': list(self.grid_resolution),
+            'spatial_domain': list(self.spatial_domain),
+            'time_step': self.time_step,
+            'total_time': self.total_time,
+            'cfl_number': self.cfl_number,
+            'boundary_type': self.boundary_type,
+            'damping': self.damping,
+            'material': self.material.name,
+        }
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+    @classmethod
+    def from_json(cls, path: str) -> 'AcousticConfig':
+        """从 JSON 文件加载配置，返回 :class:`AcousticConfig` 实例。
+
+        ``material`` 字段支持介质名称字符串（如 "空气"、"water"），
+        或直接省略（使用默认空气介质）。
+        """
+        with open(path, 'r', encoding='utf-8') as f:
+            data: Dict = json.load(f)
+
+        # 还原 material 字段
+        _name_to_medium = {m.value: m for m in MediumType}
+        _chinese_to_medium = {
+            '空气': MediumType.AIR,
+            '水': MediumType.WATER,
+            '混凝土': MediumType.CONCRETE,
+            '木材': MediumType.WOOD,
+            '玻璃': MediumType.GLASS,
+        }
+        if 'material' in data:
+            raw = data.pop('material')
+            medium = (
+                _chinese_to_medium.get(raw)
+                or _name_to_medium.get(str(raw).lower())
+            )
+            data['material'] = MaterialProperties.get_material(
+                medium if medium is not None else MediumType.AIR
+            )
+
+        # tuple 字段还原
+        for key in ('grid_resolution', 'spatial_domain'):
+            if key in data:
+                data[key] = tuple(data[key])
+
+        return cls(**data)
 
 
 class BaseAcousticSimulator(ABC):
@@ -499,6 +571,33 @@ class AcousticSimulator(BaseAcousticSimulator):
             return self.pressure[px, py]
         return 0.0
 
+    # ------------------------------------------------------------------
+    # 结果导出
+    # ------------------------------------------------------------------
+
+    def export_pressure_npy(self, path: str) -> None:
+        """将当前声压场保存为 NumPy .npy 文件（形状: [nx, ny]）。
+
+        可用 ``np.load(path)`` 读取。
+        """
+        np.save(path, self.pressure)
+
+    def export_pressure_csv(self, path: str) -> None:
+        """将当前声压场保存为 CSV 文件（行=x 轴，列=y 轴）。
+
+        可用 ``np.loadtxt(path, delimiter=',')`` 读取。
+        """
+        np.savetxt(path, self.pressure, delimiter=',')
+
+    def export_history_npy(self, path: str) -> None:
+        """将完整仿真历史保存为 NumPy .npy 文件（形状: [帧数, nx, ny]）。
+
+        若历史为空则写出一个零维数组。
+        可用 ``np.load(path)`` 读取。
+        """
+        frames = np.stack(list(self.history)) if self.history else np.empty((0, self.nx, self.ny))
+        np.save(path, frames)
+
 
 class AcousticVisualizer:
     """
@@ -656,6 +755,73 @@ class AcousticVisualizer:
         
         plt.tight_layout()
         plt.show()
+
+    # ------------------------------------------------------------------
+    # 图形 / 动画保存
+    # ------------------------------------------------------------------
+
+    def save_figure(self, path: str, dpi: int = 150) -> None:
+        """将当前图形保存到文件。
+
+        支持 PNG、PDF、SVG 等 matplotlib 支持的所有格式，
+        格式由 ``path`` 文件后缀决定。
+
+        参数
+        ----
+        path : str
+            输出文件路径，例如 ``"result.png"`` 或 ``"result.pdf"``。
+        dpi : int
+            图像分辨率（点每英寸），默认 150。
+
+        异常
+        ----
+        RuntimeError
+            若尚未创建图形（未调用 :meth:`plot_static` 或 :meth:`setup_figure`）。
+        """
+        if self.fig is None:
+            raise RuntimeError("No figure to save. Call plot_static() first.")
+        self.fig.savefig(path, bbox_inches='tight', dpi=dpi)
+
+    def save_animation_gif(self, path: str, fps: int = 20) -> None:
+        """将仿真历史保存为 GIF 动画文件（需安装 pillow）。
+
+        参数
+        ----
+        path : str
+            输出 GIF 文件路径，例如 ``"animation.gif"``。
+        fps : int
+            帧率，默认 20。
+        """
+        if not self.simulator.history:
+            raise RuntimeError("No simulation history available. Run simulate() first.")
+        if self.fig is None:
+            self.setup_figure()
+
+        def _update(frame: int) -> None:
+            if frame < len(self.simulator.history):
+                pressure = self.simulator.history[frame]
+                self.ax[0].clear()
+                self.ax[0].imshow(
+                    pressure.T,
+                    extent=[0, self.simulator.config.spatial_domain[0],
+                            0, self.simulator.config.spatial_domain[1]],
+                    cmap=self.cmap,
+                    origin='lower',
+                    aspect='auto',
+                    vmin=-0.5,
+                    vmax=0.5,
+                )
+                self.ax[0].set_title(f'声压场 t = {frame * self.simulator.dt:.3f}s')
+                self.ax[0].set_xlabel('X (m)')
+                self.ax[0].set_ylabel('Y (m)')
+
+        anim = FuncAnimation(
+            self.fig, _update,
+            frames=len(self.simulator.history),
+            interval=1000 // fps,
+            repeat=False,
+        )
+        anim.save(path, writer='pillow', fps=fps)
 
 
 class RoomAcousticSimulator(AcousticSimulator):
